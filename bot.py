@@ -20,7 +20,12 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 BRAND = os.getenv("BRAND_NAME", "Annopow")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = AsyncOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="https://api.groq.com/openai/v1",
+)
+MODEL = "llama-3.3-70b-versatile"
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
@@ -137,16 +142,21 @@ async def generate_reply(tg_id: int, question: str) -> str:
 
     system = (
         f"You are the customer support agent for {BRAND}. "
-        "Reply in the same style, tone and language as the example replies below. "
-        "Be helpful, concise and human. Never invent prices, policies or promises "
-        "that are not supported by the examples. If unsure, ask a clarifying "
-        "question or say the team will follow up.\n\n"
+        "Reply in the same style, tone and language as the example replies below.\n\n"
+        "RULES:\n"
+        "1. For questions about prices, delivery, refunds, policies or anything "
+        "specific to the business: ONLY use facts found in the examples. If the "
+        "examples don't cover it, say you'll confirm with the team - never guess.\n"
+        "2. For general questions (how things work, product advice, greetings, "
+        "small talk, technical explanations): use your own knowledge freely and "
+        "answer helpfully.\n"
+        "3. Be concise, human and friendly. Match the customer's language.\n\n"
         f"EXAMPLE PAST REPLIES:\n{example_block}"
     )
     user = f"Recent conversation:\n{history_block}\n\nCustomer's new message: {question}"
 
     resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=MODEL,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
         max_tokens=400,
@@ -310,13 +320,26 @@ async def on_customer_message(m: Message):
               f"«{m.text}»")
 
     if mode == "auto":
-        reply = await generate_reply(u.id, m.text)
+        try:
+            reply = await generate_reply(u.id, m.text)
+        except Exception as e:
+            logging.error(f"AI error: {e}")
+            await m.answer("✅ Got it! Our team will reply shortly.")
+            await bot.send_message(
+                ADMIN_ID, header + f"\n\n⚠️ AI failed ({type(e).__name__}) — reply manually.")
+            return
         await m.answer(reply)
         await log_message(u.id, "bot", reply)
         await bot.send_message(ADMIN_ID, header + f"\n\n🤖 Auto-replied:\n{reply}")
     else:
         await m.answer("✅ Got it! Our team will reply shortly.")
-        suggestion = await generate_reply(u.id, m.text)
+        try:
+            suggestion = await generate_reply(u.id, m.text)
+        except Exception as e:
+            logging.error(f"AI error: {e}")
+            await bot.send_message(
+                ADMIN_ID, header + f"\n\n⚠️ AI suggestion failed ({type(e).__name__}) — reply manually.")
+            return
         async with pool.acquire() as db:
             pid = await db.fetchval(
                 "INSERT INTO pending (customer_id, question, suggestion) "

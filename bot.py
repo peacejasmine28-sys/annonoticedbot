@@ -71,6 +71,8 @@ async def db_init():
         INSERT INTO settings (key, value) VALUES ('mode', 'manual')
         ON CONFLICT (key) DO NOTHING;
         """)
+        await db.execute(
+            "ALTER TABLE pending ADD COLUMN IF NOT EXISTS business_connection_id TEXT")
 
 async def get_mode() -> str:
     async with pool.acquire() as db:
@@ -109,6 +111,19 @@ async def save_training(q: str, a: str, source: str):
         await db.execute(
             "INSERT INTO training_data (question, answer, source) VALUES ($1,$2,$3)",
             q, a, source)
+
+async def create_pending(customer_id: int, question: str, suggestion: str,
+                         business_connection_id: str | None = None) -> int:
+    async with pool.acquire() as db:
+        return await db.fetchval(
+            "INSERT INTO pending (customer_id, question, suggestion, business_connection_id) "
+            "VALUES ($1,$2,$3,$4) RETURNING id",
+            customer_id, question, suggestion, business_connection_id)
+
+async def set_pending_admin_msg(pid: int, admin_msg_id: int):
+    async with pool.acquire() as db:
+        await db.execute("UPDATE pending SET admin_msg_id=$1 WHERE id=$2",
+                         admin_msg_id, pid)
 
 async def find_similar_training(question: str, limit: int = 6):
     words = [w.lower() for w in question.split() if len(w) > 3]
@@ -164,7 +179,7 @@ async def generate_reply(tg_id: int, question: str) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-# ---------- KEYBOARDS ----------
+# ---------- HELPERS ----------
 
 def suggestion_kb(pending_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -174,6 +189,32 @@ def suggestion_kb(pending_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✍️ I'll reply myself (reply to this msg)",
                              callback_data=f"noop:{pending_id}"),
     ]])
+
+async def send_to_customer(customer_id: int, text: str,
+                           business_connection_id: str | None):
+    """Send a message either via the bot chat or into the personal-account DM."""
+    if business_connection_id:
+        await bot.send_message(customer_id, text,
+                               business_connection_id=business_connection_id)
+    else:
+        await bot.send_message(customer_id, text)
+
+async def notify_with_suggestion(header: str, customer_id: int, question: str,
+                                 business_connection_id: str | None):
+    """Generate a suggestion, store it as pending, send admin card with buttons."""
+    try:
+        suggestion = await generate_reply(customer_id, question)
+    except Exception as e:
+        logging.error(f"AI error: {e}")
+        await bot.send_message(ADMIN_ID, header + "\n\n⚠️ AI failed — reply manually.")
+        return
+    pid = await create_pending(customer_id, question, suggestion,
+                               business_connection_id)
+    sent = await bot.send_message(
+        ADMIN_ID,
+        header + f"\n\n🤖 Suggested reply:\n{suggestion}",
+        reply_markup=suggestion_kb(pid))
+    await set_pending_admin_msg(pid, sent.message_id)
 
 # ---------- ADMIN COMMANDS ----------
 
@@ -255,13 +296,21 @@ async def on_button(cb: CallbackQuery):
     pid = int(pid)
     async with pool.acquire() as db:
         row = await db.fetchrow(
-            "SELECT customer_id, question, suggestion FROM pending WHERE id=$1", pid)
+            "SELECT customer_id, question, suggestion, business_connection_id "
+            "FROM pending WHERE id=$1", pid)
     if not row:
         return await cb.answer("Expired.")
-    customer_id, question, suggestion = row["customer_id"], row["question"], row["suggestion"]
+    customer_id = row["customer_id"]
+    question = row["question"]
+    suggestion = row["suggestion"]
+    bcid = row["business_connection_id"]
 
     if action == "send":
-        await bot.send_message(customer_id, suggestion)
+        try:
+            await send_to_customer(customer_id, suggestion, bcid)
+        except Exception as e:
+            logging.error(f"Send failed: {e}")
+            return await cb.answer(f"Send failed: {type(e).__name__}", show_alert=True)
         await log_message(customer_id, "admin", suggestion)
         await save_training(question, suggestion, "approved_ai")
         await cb.message.edit_text(cb.message.text + "\n\n✅ Sent.")
@@ -284,11 +333,17 @@ async def on_button(cb: CallbackQuery):
 async def admin_reply(m: Message):
     async with pool.acquire() as db:
         row = await db.fetchrow(
-            "SELECT customer_id, question FROM pending WHERE admin_msg_id=$1",
+            "SELECT customer_id, question, business_connection_id "
+            "FROM pending WHERE admin_msg_id=$1",
             m.reply_to_message.message_id)
     if not row:
         return
-    await bot.send_message(row["customer_id"], m.text)
+    try:
+        await send_to_customer(row["customer_id"], m.text,
+                               row["business_connection_id"])
+    except Exception as e:
+        logging.error(f"Send failed: {e}")
+        return await m.answer(f"⚠️ Send failed: {type(e).__name__}")
     await log_message(row["customer_id"], "admin", m.text)
     await save_training(row["question"], m.text, "admin_manual")
     await m.answer("✅ Sent & learned.")
@@ -303,19 +358,14 @@ async def on_business_message(m: Message):
     await log_message(m.from_user.id, "customer", m.text)
 
     u = m.from_user
+    bcid = m.business_connection_id
     header = (f"💬 DM to your personal account\n"
               f"From: {u.first_name or ''} @{u.username or '—'} (ID {u.id})\n\n"
               f"«{m.text}»")
 
     mode = await get_mode()
     if mode != "auto":
-        try:
-            suggestion = await generate_reply(u.id, m.text)
-        except Exception as e:
-            logging.error(f"AI error: {e}")
-            await bot.send_message(ADMIN_ID, header + "\n\n⚠️ AI failed — reply manually.")
-            return
-        await bot.send_message(ADMIN_ID, header + f"\n\n🤖 Suggested reply (send it yourself in the DM):\n{suggestion}")
+        await notify_with_suggestion(header, u.id, m.text, bcid)
         return
 
     try:
@@ -326,13 +376,16 @@ async def on_business_message(m: Message):
         return
 
     try:
-        await m.answer(reply, business_connection_id=m.business_connection_id)
+        await m.answer(reply)  # aiogram attaches the business connection itself
     except Exception as e:
         logging.error(f"Business send failed: {e}")
-        await bot.send_message(
+        # fall back to a suggestion card with buttons so you can retry/act
+        pid = await create_pending(u.id, m.text, reply, bcid)
+        sent = await bot.send_message(
             ADMIN_ID,
-            header + f"\n\n⚠️ Couldn't send in your DM ({type(e).__name__}). "
-                     f"Suggested reply:\n{reply}")
+            header + f"\n\n⚠️ Couldn't auto-send. Suggested reply:\n{reply}",
+            reply_markup=suggestion_kb(pid))
+        await set_pending_admin_msg(pid, sent.message_id)
         return
 
     await log_message(u.id, "bot", reply)

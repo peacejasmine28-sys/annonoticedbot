@@ -7,7 +7,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, BusinessConnection,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from dotenv import load_dotenv
@@ -192,7 +192,6 @@ def suggestion_kb(pending_id: int) -> InlineKeyboardMarkup:
 
 async def send_to_customer(customer_id: int, text: str,
                            business_connection_id: str | None):
-    """Send a message either via the bot chat or into the personal-account DM."""
     if business_connection_id:
         await bot.send_message(customer_id, text,
                                business_connection_id=business_connection_id)
@@ -201,7 +200,6 @@ async def send_to_customer(customer_id: int, text: str,
 
 async def notify_with_suggestion(header: str, customer_id: int, question: str,
                                  business_connection_id: str | None):
-    """Generate a suggestion, store it as pending, send admin card with buttons."""
     try:
         suggestion = await generate_reply(customer_id, question)
     except Exception as e:
@@ -215,6 +213,30 @@ async def notify_with_suggestion(header: str, customer_id: int, question: str,
         header + f"\n\n🤖 Suggested reply:\n{suggestion}",
         reply_markup=suggestion_kb(pid))
     await set_pending_admin_msg(pid, sent.message_id)
+
+# ---------- BUSINESS CONNECTION DIAGNOSTIC ----------
+
+@router.business_connection()
+async def on_business_connection(bc: BusinessConnection):
+    rights = getattr(bc, "rights", None)
+    if rights is not None:
+        rights_text = "\n".join(
+            f"• {k}: {'✅' if v else '❌'}"
+            for k, v in rights.model_dump().items() if v is not None)
+    else:
+        can_reply = getattr(bc, "can_reply", None)
+        rights_text = f"• can_reply: {'✅' if can_reply else '❌'}"
+    status = "🟢 ENABLED" if bc.is_enabled else "🔴 DISABLED"
+    info = (f"🔌 Business connection update\n"
+            f"Status: {status}\n"
+            f"Connection ID: {bc.id}\n"
+            f"Account: {bc.user.first_name} (ID {bc.user_id})\n\n"
+            f"Granted rights:\n{rights_text}")
+    logging.info(info)
+    try:
+        await bot.send_message(ADMIN_ID, info)
+    except Exception as e:
+        logging.error(f"Couldn't notify admin about connection: {e}")
 
 # ---------- ADMIN COMMANDS ----------
 
@@ -353,7 +375,7 @@ async def admin_reply(m: Message):
 @router.business_message(F.text)
 async def on_business_message(m: Message):
     if m.from_user.id == ADMIN_ID:
-        return  # don't reply to your own messages
+        return
     await upsert_customer(m)
     await log_message(m.from_user.id, "customer", m.text)
 
@@ -376,10 +398,9 @@ async def on_business_message(m: Message):
         return
 
     try:
-        await m.answer(reply)  # aiogram attaches the business connection itself
+        await m.answer(reply)
     except Exception as e:
         logging.error(f"Business send failed: {e}")
-        # fall back to a suggestion card with buttons so you can retry/act
         pid = await create_pending(u.id, m.text, reply, bcid)
         sent = await bot.send_message(
             ADMIN_ID,
@@ -404,7 +425,7 @@ async def cmd_start(m: Message):
 @router.message(F.text)
 async def on_other_message(m: Message):
     if is_admin(m):
-        return  # admin free text (not a command, not a reply) — ignore quietly
+        return
     await m.answer(f"👋 For {BRAND} support, please message @annopow directly.")
 
 # ---------- MAIN ----------

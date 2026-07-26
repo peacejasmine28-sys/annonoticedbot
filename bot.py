@@ -1,6 +1,8 @@
 import asyncio
+import io
 import logging
 import os
+import zipfile
 from datetime import datetime, timezone
 
 import asyncpg
@@ -10,6 +12,7 @@ from aiogram.types import (
     Message, CallbackQuery, BusinessConnection,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -19,6 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 BRAND = os.getenv("BRAND_NAME", "Annopow")
 DATABASE_URL = os.getenv("DATABASE_URL")
+MY_NAME = os.getenv("MY_NAME", "Anno Pow")  # your display name in Telegram exports
 
 client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -214,6 +218,78 @@ async def notify_with_suggestion(header: str, customer_id: int, question: str,
         reply_markup=suggestion_kb(pid))
     await set_pending_admin_msg(pid, sent.message_id)
 
+# ---------- CHAT EXPORT IMPORT (send a ZIP of the 'chats' folder) ----------
+
+def extract_pairs_from_html(html: str, my_name: str):
+    """Yield (question, answer) pairs from one messages.html content."""
+    soup = BeautifulSoup(html, "html.parser")
+    last_sender = None
+    last_q = None
+    for msg in soup.select("div.message.default"):
+        name_el = msg.select_one("div.from_name")
+        if name_el:
+            last_sender = name_el.get_text(strip=True)
+        text_el = msg.select_one("div.text")
+        if not text_el or not last_sender:
+            continue
+        text = text_el.get_text(" ", strip=True)
+        if not text:
+            continue
+        if last_sender != my_name:
+            last_q = text
+        elif last_q:
+            yield last_q[:1000], text[:1000]
+            last_q = None
+
+@router.message(F.from_user.id == ADMIN_ID, F.document)
+async def on_admin_document(m: Message):
+    doc = m.document
+    if not doc.file_name or not doc.file_name.lower().endswith(".zip"):
+        return await m.answer("Send me a ZIP file of your export's 'chats' folder.")
+    if doc.file_size and doc.file_size > 19 * 1024 * 1024:
+        return await m.answer(
+            "⚠️ File too big — Telegram only lets bots download up to ~20 MB.\n"
+            "Re-export WITHOUT media (untick photos/videos/voice/stickers), "
+            "or split the chats folder into smaller ZIPs.")
+    status = await m.answer("⏳ Downloading ZIP...")
+    try:
+        buf = io.BytesIO()
+        await bot.download(doc, destination=buf)
+        buf.seek(0)
+    except Exception as e:
+        logging.error(f"Download failed: {e}")
+        return await status.edit_text(f"⚠️ Download failed: {type(e).__name__}")
+
+    await status.edit_text("⏳ Importing conversations...")
+    pairs = 0
+    files_done = 0
+    try:
+        with zipfile.ZipFile(buf) as zf:
+            html_names = [n for n in zf.namelist()
+                          if n.lower().endswith(".html") and "messages" in n.lower()]
+            for name in html_names:
+                try:
+                    html = zf.read(name).decode("utf-8", errors="ignore")
+                    for q, a in extract_pairs_from_html(html, MY_NAME):
+                        await save_training(q, a, "zip_import")
+                        pairs += 1
+                except Exception as e:
+                    logging.error(f"Skipped {name}: {e}")
+                files_done += 1
+                if files_done % 25 == 0:
+                    try:
+                        await status.edit_text(
+                            f"⏳ Importing... {files_done}/{len(html_names)} files, "
+                            f"{pairs} pairs so far")
+                    except Exception:
+                        pass
+    except zipfile.BadZipFile:
+        return await status.edit_text("⚠️ That file isn't a valid ZIP.")
+
+    await status.edit_text(
+        f"✅ Import complete!\nFiles processed: {files_done}\n"
+        f"Q&A pairs learned: {pairs}\n\nCheck /stats to confirm.")
+
 # ---------- BUSINESS CONNECTION DIAGNOSTIC ----------
 
 @router.business_connection()
@@ -351,7 +427,7 @@ async def on_button(cb: CallbackQuery):
 
 # ---------- ADMIN MANUAL REPLY ----------
 
-@router.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
+@router.message(F.from_user.id == ADMIN_ID, F.reply_to_message, F.text)
 async def admin_reply(m: Message):
     async with pool.acquire() as db:
         row = await db.fetchrow(
@@ -419,7 +495,8 @@ async def cmd_start(m: Message):
     if is_admin(m):
         return await m.answer(
             "👋 Admin panel ready.\n"
-            "/auto /manual /stats /customers /broadcast /learn Q | A")
+            "/auto /manual /stats /customers /broadcast /learn Q | A\n"
+            "📦 Send me a ZIP of your export's 'chats' folder to import history.")
     await m.answer(f"👋 For {BRAND} support, please message @annopow directly.")
 
 @router.message(F.text)
